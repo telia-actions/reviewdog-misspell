@@ -1,0 +1,125 @@
+name: sync-upstream
+
+# Keeps this fork in sync with reviewdog/action-misspell:
+#   - fast-forwards master
+#   - mirrors all tags (including the moving v1 / v1.x tags)
+#   - mirrors GitHub releases
+on:
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: reviewdog/action-misspell
+  DEFAULT_BRANCH: master
+  # Files owned by this fork. They are replayed as a single commit on top of
+  # upstream after every sync; everything else is taken verbatim from upstream.
+  FORK_FILES: .github/workflows/sync-upstream.yml
+  # SYNC_TOKEN must be able to write workflow files, since upstream changes
+  # touch .github/workflows/. Classic PAT: `repo` + `workflow` scopes.
+  # Fine-grained PAT: Contents RW + Workflows RW. GITHUB_TOKEN cannot do this.
+  GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --tags --force --prune upstream
+
+      - name: Rebuild default branch on top of upstream
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          stash=$(mktemp -d)
+          for f in ${FORK_FILES}; do
+            if git show "origin/${DEFAULT_BRANCH}:$f" > /dev/null 2>&1; then
+              mkdir -p "$stash/$(dirname "$f")"
+              git show "origin/${DEFAULT_BRANCH}:$f" > "$stash/$f"
+            fi
+          done
+
+          git checkout -B "${DEFAULT_BRANCH}" "upstream/${DEFAULT_BRANCH}"
+
+          for f in ${FORK_FILES}; do
+            if [ -f "$stash/$f" ]; then
+              mkdir -p "$(dirname "$f")"
+              cp "$stash/$f" "$f"
+              git add "$f"
+            fi
+          done
+
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: re-apply fork-owned files after upstream sync'
+          fi
+
+          if [ "$(git rev-parse "origin/${DEFAULT_BRANCH}")" = "$(git rev-parse "${DEFAULT_BRANCH}")" ]; then
+            echo "Already up to date."
+          else
+            git push --force-with-lease="${DEFAULT_BRANCH}:$(git rev-parse "origin/${DEFAULT_BRANCH}")" \
+              origin "${DEFAULT_BRANCH}"
+          fi
+
+      - name: Mirror tags
+        run: |
+          set -euo pipefail
+          # --force so moving tags (v1, v1.28) follow upstream.
+          git push --force --tags origin
+
+      - name: Mirror releases
+        run: |
+          set -euo pipefail
+          gh release list --repo "${UPSTREAM_REPO}" --limit 200 --json tagName \
+            --jq '.[].tagName' > upstream_releases.txt
+          gh release list --repo "${GITHUB_REPOSITORY}" --limit 200 --json tagName \
+            --jq '.[].tagName' > fork_releases.txt
+
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            if grep -qxF "$tag" fork_releases.txt; then
+              continue
+            fi
+            echo "Creating release $tag"
+            gh release view "$tag" --repo "${UPSTREAM_REPO}" \
+              --json name,body,isPrerelease,isDraft > release.json
+            name=$(jq -r '.name // ""' release.json)
+            prerelease=$(jq -r '.isPrerelease' release.json)
+            draft=$(jq -r '.isDraft' release.json)
+            [ "$draft" = "true" ] && continue
+            jq -r '.body // ""' release.json > body.md
+            args=()
+            [ "$prerelease" = "true" ] && args+=(--prerelease)
+            # The "Latest" marker is set explicitly in the next step.
+            gh release create "$tag" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${name:-$tag}" \
+              --notes-file body.md \
+              --latest=false \
+              "${args[@]}"
+          done < upstream_releases.txt
+
+      - name: Mirror "Latest" release marker
+        run: |
+          set -euo pipefail
+          latest=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')
+          echo "Upstream latest release: ${latest}"
+          gh release edit "$latest" --repo "${GITHUB_REPOSITORY}" --latest
